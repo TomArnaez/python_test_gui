@@ -1,11 +1,14 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+import logging
 from pathlib import Path
+import time
 from typing import Dict, Generic, List, Optional, Type, TypeVar
 from enum import Enum
 from numpy.typing import NDArray
 import numpy as np
 
+from detector import sequence_capture
 from tests.io import save_tiff_stack
 
 class TestType(Enum):
@@ -15,6 +18,12 @@ class TestType(Enum):
 
 class TestResult(ABC):
     """Abstract base class for all test results."""
+
+    @property
+    @abstractmethod
+    def test_type(self) -> TestType:
+        """Return the unique identifier for the test."""
+        pass
 
     @abstractmethod
     def save_frame_data(self, base_path: Path):
@@ -46,7 +55,7 @@ def register_test(test_name: str):
 @dataclass
 class IterationSettings:
     num_iterations: int
-    iteration_time_mins: int 
+    iteration_wait_time_mins: int 
 
 @dataclass
 class DarkCurrentDataPoint:
@@ -62,13 +71,24 @@ class DarkCurrentFrameData:
 class DarkCurrentTestParams:
     lower_exp_time: int
     upper_exp_time: int
+    frames_per_sequence: int
     iteration_settings: IterationSettings
 
 @dataclass
 class DarkCurrentTestResult(TestResult):
     params: DarkCurrentTestParams
     dark_current_data: List[DarkCurrentDataPoint]
-    dark_current_frame_data: Optional[DarkCurrentFrameData] 
+    dark_current_frame_data: Optional[DarkCurrentFrameData]
+
+    @property
+    def test_type(self) -> TestType:
+        return TestType.DARK_CURRENT
+    
+    def to_dict(self):
+        return {
+            'params': asdict(self.params),
+            'dark_current_data': [asdict(data_point) for data_point in self.dark_current_data],
+        }
 
     def save_frame_data(self, base_path: Path):
         if self.dark_current_frame_data is None:
@@ -98,20 +118,23 @@ class DarkCurrentTest(Test[DarkCurrentTestResult]):
         if (keep_frame_data):
             dark_current_frame_data = DarkCurrentFrameData([], [])
 
-        for _ in range(self.params.iteration_settings.num_iterations):
-            arr1 = np.zeros((50, 50), dtype=np.uint16)
-            arr2 = np.zeros((50, 50), dtype=np.uint16)
+        for i in range(self.params.iteration_settings.num_iterations):
+            lower_exp_frame = sequence_capture(device, self.params.frames_per_sequence, self.params.lower_exp_time)
+            upper_exp_frame = sequence_capture(device, self.params.frames_per_sequence, self.params.upper_exp_time)
 
             if (keep_frame_data):
-                dark_current_frame_data.lower_exp_time_frames.append(arr1)
-                dark_current_frame_data.upper_exp_time_frames.append(arr2)
+                dark_current_frame_data.lower_exp_time_frames.append(lower_exp_frame)
+                dark_current_frame_data.upper_exp_time_frames.append(upper_exp_frame)
 
-            result = arr1.astype(np.int32) - arr2.astype(np.int32)
+            result = lower_exp_frame.astype(np.int32) - upper_exp_frame.astype(np.int32)
             mean = result.mean()
             dark_current = mean / float(self.params.upper_exp_time - self.params.lower_exp_time)
             temperature = 0.0
 
             dark_currents.append(DarkCurrentDataPoint(temperature, dark_current))
+            
+            logging.debug(f"Waiting for {self.params.iteration_settings.iteration_wait_time_mins} minutes")
+            time.sleep(float(self.params.iteration_settings.iteration_wait_time_mins) / 60.0)
 
         return DarkCurrentTestResult(self.params, dark_currents, dark_current_frame_data)
     
